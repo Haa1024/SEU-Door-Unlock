@@ -30,6 +30,12 @@
 
 > ⚠️ 鸠占鹊巢版是本地自用变体：`com.whxinna.userplatform` 是官方「住理生活」的包名，唯一合法归属方是官方。它被公开在这里只是为了留存构建产物，请勿再分发或用于任何商业用途。
 
+## 其他平台
+
+**iOS** —— [门钥 · seu-dorm-unlock-ios](https://github.com/Kevin-2106/seu-dorm-unlock-ios)
+
+由 [@Kevin-2106](https://github.com/Kevin-2106) 基于本项目公开的协议独立实现的 iOS 客户端，支持蓝牙开门、NFC 碰锁开门（需 TrollStore / 越狱）、锁屏小组件、锁屏控制与快捷指令。
+
 ## 使用方法
 
 ### 1. 配置凭证
@@ -56,3 +62,7 @@
 ## License
 
 MIT
+
+## 致谢
+
+感谢所有对本项目做出贡献的人。
