@@ -171,29 +171,27 @@ class BleUnlockManager(
                     }
                 }
                 unlockResult.resultCode == 25 -> {
-                    // 25: 离线次数用完 → 从服务器刷新 chainKey 后重试
+                    // 25: 离线次数已用完 → 从服务器刷新 chainKey 后重试
                     log("离线次数已用完, 从服务器刷新凭证...")
-                    if (!SettingsManager.isLoggedIn()) {
-                        throw Exception("离线次数已用完\n请在设置中登录后重试")
+                    // 判定条件从「有没有 token」换成「能不能重新登录」：
+                    // 留着一串过期 token 没有意义，能拿到密码才算有救
+                    if (!SettingsManager.canAutoRelogin && !SettingsManager.isLoggedIn()) {
+                        throw Exception("离线次数已用完，且登录已失效\n请到设置页重新登录")
                     }
                     _statusText.value = "刷新凭证中..."
                     val newKey = refreshChainKeyFromServer()
-                    if (newKey == null) throw Exception("刷新凭证失败, 请用原 App 开门一次")
+                        ?: throw Exception("自动刷新凭证失败\n$lastRefreshError")
                     // 重试完整开门流程
                     retryUnlockWithNewKey()
                 }
                 unlockResult.resultCode == 24 -> {
-                    // 24: 凭证过期, 从服务器获取新凭证后重试
-                    log("凭证过期(0x18), 从服务器刷新凭证...")
-                    _statusText.value = "登录服务器..."
-                    // 先确保登录，再获取参数
-                    val loggedIn = ensureLoggedIn()
-                    if (!loggedIn) {
-                        throw Exception("凭证已过期\n请在设置中登录后重试")
-                    }
+                    // 24: 凭证脱链, 从服务器取回当前链位置后重试
+                    log("凭证脱链(0x18), 从服务器刷新凭证...")
                     _statusText.value = "刷新凭证中..."
+                    // 重登已经内建在 refreshChainKeyFromServer 里（fetchAddressAuto）：
+                    // 先直连试一次，只有真的报 token 失效才去重登，少一次多余登录
                     val newKey = refreshChainKeyFromServer()
-                    if (newKey == null) throw Exception("刷新凭证失败, 请用原 App 开门一次")
+                        ?: throw Exception("自动刷新凭证失败\n$lastRefreshError")
                     // 重试完整开门流程
                     retryUnlockWithNewKey()
                 }
@@ -242,34 +240,59 @@ class BleUnlockManager(
 
     // ─── 从服务器刷新 chainKey（错误 24/25 自动恢复） ───
 
-    /** 确保已登录：如果 token 缺失则尝试用存储的账号密码自动登录 */
-    private suspend fun ensureLoggedIn(): Boolean {
-        if (SettingsManager.isLoggedIn()) return true
-        val phone = SettingsManager.loginPhone
-        val pwd = SettingsManager.loginPassword
-        if (phone.isBlank() || pwd.isBlank()) return false
-        log("尝试自动登录: $phone")
-        val result = ServerApi.login(phone, pwd)
-        if (result.success) {
-            log("自动登录成功")
-            return true
-        }
-        log("自动登录失败: ${result.error}")
-        return false
-    }
+    /** 最近一次刷新失败的原因 —— 把「为什么失败」如实报出来，而不是笼统一句"刷新失败" */
+    private var lastRefreshError: String? = null
 
+    /**
+     * 从服务器取回当前有效的 chainKey。
+     *
+     * 走 [ServerApi.fetchAddressAuto]：内部会在识别到 token 过期时**静默重登再重试一次**。
+     * 早先这里直接调 fetchAddress()，token 一过期就必然拿到 null，于是表现成
+     * 「必须手动去设置页点一下登录」—— 现在这条自动恢复链才算闭环。
+     */
     private suspend fun refreshChainKeyFromServer(): String? {
+        lastRefreshError = null
         try {
-            val addr = ServerApi.fetchAddress()
-            if (addr.chainKey.isNotBlank()) {
-                SettingsManager.chainKey = addr.chainKey
-                SettingsManager.credentialId = addr.credentialId
-                log("已从服务器获取新 chainKey: ${addr.chainKey.take(16)}...")
-                return addr.chainKey
+            val addr = ServerApi.fetchAddressAuto()
+            val key = addr.chainKey.trim()
+
+            if (key.isBlank()) {
+                lastRefreshError = "服务器没有返回凭证（该账号下可能没有这台门锁的记录）"
+                log("刷新凭证失败: $lastRefreshError")
+                return null
             }
+            // 格式把关：自动流程只认 32 字节 hex。写进一个长度不对的值，
+            // 会让下次开门连 0x74 都构造不出来，比"刷新失败"更糟。
+            if (key.length != 64 || key.any { it !in "0123456789abcdefABCDEF" }) {
+                lastRefreshError = "服务器返回的凭证格式异常（长度 ${key.length}），已放弃覆盖本地"
+                log("刷新凭证失败: $lastRefreshError")
+                return null
+            }
+            // 拉回来的和本地一模一样 → 服务器侧也没更新过，重试必然还失败。
+            // 这种情况只有官方 App 开门时才会把链追上去，老实告诉用户比反复重试有用。
+            if (key.equals(SettingsManager.chainKey, ignoreCase = true)) {
+                lastRefreshError =
+                    "服务器上的凭证和本地相同，说明服务器侧也已落后于门锁\n" +
+                        "请用住理生活官方 App 开一次门追链后再试"
+                log("刷新凭证失败: 服务器凭证未更新")
+                return null
+            }
+
+            SettingsManager.chainKey = key
+            SettingsManager.credentialId = addr.credentialId
+            log("已从服务器获取新 chainKey: ${key.take(16)}...")
+            return key
+        } catch (e: ServerApi.TokenExpiredException) {
+            lastRefreshError = if (SettingsManager.canAutoRelogin) {
+                "登录已失效，静默重登也没成功（密码可能改过，请到设置页重新登录一次）"
+            } else {
+                "登录已失效，且本地没保存密码，无法自动重登（请到设置页点一次「支付宝一键登录」）"
+            }
+            log("刷新凭证失败: $lastRefreshError")
             return null
         } catch (e: Exception) {
-            log("刷新凭证异常: ${e.message}")
+            lastRefreshError = e.message?.take(150) ?: "网络异常"
+            log("刷新凭证异常: $lastRefreshError")
             return null
         }
     }

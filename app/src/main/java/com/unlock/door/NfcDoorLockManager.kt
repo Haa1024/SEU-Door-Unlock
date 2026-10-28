@@ -60,8 +60,15 @@ object NfcDoorLockManager {
      */
     fun handleTag(tag: Tag, callback: ((Boolean, String) -> Unit)? = null) {
         executor.execute {
+            // ⚠️ 异常也必须回一个结果：原来写的是 getOrElse { null }，然后 result?.let 才回调，
+            //    一旦 processTag 抛出未捕获异常就**永远没人通知调用方**，界面会带着旋转环
+            //    空转到超时才报「开门超时」。这里改成异常一定给出 (false, 原因)。
+            //    null 仍然保留原语义：写卡模式把标签交回 MainActivity，不需要结果。
             val result = runCatching { processTag(tag) }
-                .getOrElse { appendLog("✗ 处理异常: ${it.message}"); null }
+                .getOrElse {
+                    appendLog("✗ 处理异常: ${it.javaClass.simpleName}: ${it.message}")
+                    Pair(false, "处理异常：${it.message ?: it.javaClass.simpleName}")
+                }
             result?.let { (ok, msg) ->
                 mainHandler.post {
                     if (callback != null) callback.invoke(ok, msg)
@@ -71,36 +78,51 @@ object NfcDoorLockManager {
         }
     }
 
-    /** @return (是否成功, 提示消息) */
+    /** @return (是否成功, 提示消息)。null 表示写卡模式已接管，无需回报结果 */
     private fun processTag(tag: Tag): Pair<Boolean, String>? {
         appendLog("═══ 标签发现 ═══")
         appendLog("技术: ${tag.techList.joinToString(",") { it.substringAfterLast('.') }}")
         appendLog("UID: ${Crypto.bytesToHex(tag.id)}")
         diagnoseUid(tag.id)
 
-        // ── 0. 读 NDEF → 判断标签类型（门锁感应区自带 NDEF，URI 形如 ?t=lock&d=<id>）──
-        val (uri, ndefDeviceId) = readTagIdentity(tag)
-
         if (writeCardMode) {
             // 写卡模式交回 MainActivity 处理 (需要 Toast + 退出写卡模式)
+            // 提到最前面：写卡只需要 Tag 本身，没必要先替门锁读一遍 NDEF
             return null
         }
 
-        // 磁标签 (unlockdoor://open): 走 BLE 开门
-        if (uri?.scheme == "unlockdoor") {
-            appendLog("识别为本 App 磁标签 → 触发 BLE 开门")
-            return Pair(true, STICKER_UNLOCK)
+        // ── 0. 取门锁设备ID：UID 反解优先 ──
+        //
+        // ⚠️ 2026-10-28 修正：原实现先读 NDEF 再发指令，等于对同一颗标签**连两次**。
+        //   门锁感应区是锁 MCU **软件模拟**的 Type 2 标签（UID 带 ASCII "XN-" 前缀即为证据），
+        //   每一页 READ 都要锁固件应答，比真标签慢一个量级。而平台为了凑出
+        //   NDEF_DISCOVERED 已经把整包 NDEF 读过一遍了 —— 我们再 connect + 逐页读一遍，
+        //   不只是白花几百毫秒：随后的 ndef.close() 会把射频会话拆掉，紧接着的
+        //   NfcA.connect() 很可能拿到一个已失效的句柄，三次重试**瞬间全败**，
+        //   界面上就表现为「贴上去直接显示 NFC 未成功」。
+        //   设备ID本来就藏在 UID 里（XN- + 4 字节小端右移 8 位），根本不必读 NDEF。
+        var deviceId: Int? = deviceIdFromUid(tag.id)
+        if (deviceId != null) {
+            appendLog("设备ID 来自 UID: $deviceId（跳过 NDEF 读取，省一次 connect）")
+        } else {
+            // UID 不是 XN- 规则：可能是本 App 写的磁标签，也可能是异常锁型 —— 读 NDEF 分辨
+            val (uri, ndefDeviceId) = readTagIdentity(tag)
+            if (uri?.scheme == "unlockdoor") {
+                appendLog("识别为本 App 磁标签 → 触发 BLE 开门")
+                return Pair(true, STICKER_UNLOCK)
+            }
+            deviceId = ndefDeviceId
+            if (deviceId != null) appendLog("设备ID 来自 NDEF: $deviceId")
         }
 
-        // ── 0.5 设备ID来源: NDEF URL 优先; 无 NDEF 时回退已配置设备ID ──
-        var deviceId: Int? = ndefDeviceId
+        // ── 0.5 兜底：已配置设备ID ──
         if (deviceId == null) {
             val cfgId = if (SettingsManager.isInitialized()) SettingsManager.deviceId else 0
             if (cfgId > 0) {
-                appendLog("标签未提供 NDEF 设备ID → 回退使用已配置设备ID: $cfgId (BLE 蓝牙名 XN-$cfgId)")
+                appendLog("标签未提供设备ID → 回退使用已配置设备ID: $cfgId (BLE 蓝牙名 XN-$cfgId)")
                 deviceId = cfgId
             } else {
-                appendLog("✗ 标签无 NDEF 且未配置设备ID, 无法构造开锁指令 (请先完成设置页配置)")
+                appendLog("✗ 标签无设备ID 且未配置, 无法构造开锁指令 (请先完成设置页配置)")
                 return Pair(false, "无法识别门锁标签")
             }
         }
@@ -119,10 +141,10 @@ object NfcDoorLockManager {
         appendLog("→ 指令: ${Crypto.bytesToHex(cmd)}")
 
         // ── 3. 逐通道试探传输 ──
-        val response = tryTransports(tag, cmd)
+        val (response, cause) = tryTransports(tag, cmd)
         if (response == null) {
-            appendLog("✗ 所有通道未获得有效响应 (日志已记录, 可反馈分析)")
-            return Pair(false, "NFC 未获得门锁响应")
+            appendLog("✗ 未获得有效响应：$cause")
+            return Pair(false, "无响应：$cause")
         }
 
         // ── 4. 解析 0xB1 响应 ──
@@ -244,8 +266,14 @@ object NfcDoorLockManager {
     /** NfcA 发送重试次数（NFC 通信易被标签移动打断，官方 H5 同样是 3 次） */
     private const val TRANSPORT_RETRIES = 3
 
-    /** 单次 transceive 的超时（毫秒） */
-    private const val TRANSPORT_TIMEOUT_MS = 2000
+    /**
+     * 单次 transceive 的超时（毫秒）。
+     *
+     * 从 2000 降到 700：门锁的 0xB1 应答是固件在几十毫秒内回的，真等不到就说明
+     * 会话已经断了，多等只会把「贴附窗口」白白耗光 —— 三次退避撑到 6 秒，
+     * 用户早就抬手了。短超时 + 多轮才是对的策略。
+     */
+    private const val TRANSPORT_TIMEOUT_MS = 700
 
     /**
      * 两次重试之间的间隔（毫秒）。
@@ -270,16 +298,21 @@ object NfcDoorLockManager {
      *
      * 重试 3 次，全部失败才返回 null（调用方据此回退蓝牙）。每轮都重新取一次
      * NfcA 实例并重新 connect，轮间留 [RETRY_GAP_MS] 空档，见该常量的说明。
+     *
+     * @return (响应, 失败原因)。响应非 null 时原因为空串；响应为 null 时原因会一路
+     *         带到界面上，不再让用户只看到一句笼统的「NFC 未成功」。
      */
-    private fun tryTransports(tag: Tag, cmd: ByteArray): ByteArray? {
+    private fun tryTransports(tag: Tag, cmd: ByteArray): Pair<ByteArray?, String> {
+        var lastCause = "未开始尝试"
         repeat(TRANSPORT_RETRIES) { attempt ->
             val round = attempt + 1
 
             // 每轮重新从 Tag 取实例：上一轮 close() 过的实例不再复用
             val a = NfcA.get(tag)
             if (a == null) {
-                appendLog("✗ 标签不支持 NfcA，无法发送 0xB1 指令")
-                return null
+                val techs = tag.techList.joinToString(",") { it.substringAfterLast('.') }
+                appendLog("✗ 标签 techList 不含 NfcA（$techs），无法发送 0xB1 指令")
+                return null to "标签不含 NfcA（$techs）"
             }
 
             try {
@@ -294,10 +327,12 @@ object NfcDoorLockManager {
                 appendLog("[NfcA] → 第 $round/$TRANSPORT_RETRIES 次发送 (${cmd.size}B)")
                 val resp = a.transceive(cmd)
                 appendLog("[NfcA] ← 响应(${resp.size}B): ${Crypto.bytesToHex(resp)}")
-                if (resp.size >= 3 && resp[0] == 0xB1.toByte()) return resp
+                if (resp.size >= 3 && resp[0] == 0xB1.toByte()) return resp to ""
+                lastCause = "响应非 0xB1 帧"
                 appendLog("[NfcA] 第 $round/$TRANSPORT_RETRIES 次响应不是合法 0xB1 帧")
             } catch (e: Exception) {
-                appendLog("[NfcA] 第 $round/$TRANSPORT_RETRIES 次失败: ${e.message}")
+                lastCause = e.message ?: e.javaClass.simpleName
+                appendLog("[NfcA] 第 $round/$TRANSPORT_RETRIES 次失败: $lastCause")
             } finally {
                 runCatching { a.close() }
             }
@@ -307,7 +342,7 @@ object NfcDoorLockManager {
             }
         }
 
-        appendLog("✗ NfcA $TRANSPORT_RETRIES 次尝试均未获得合法响应 → 交给调用方回退蓝牙")
-        return null
+        appendLog("✗ NfcA $TRANSPORT_RETRIES 次尝试均未获得合法响应（$lastCause）→ 交给调用方回退蓝牙")
+        return null to lastCause
     }
 }

@@ -20,8 +20,8 @@ android {
         applicationId = "com.unlock.door"
         minSdk = 24
         targetSdk = 34
-        versionCode = 9
-        versionName = "1.4.1"
+        versionCode = 10
+        versionName = "1.5.0"
     }
 
     buildTypes {

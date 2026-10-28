@@ -2,6 +2,7 @@ package com.unlock.door
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -115,32 +116,46 @@ object ServerApi {
         return params
     }
 
-    // ─── 发送验证码 ───
+    // ─── 登录图形验证码 ───
 
-    data class CodeResult(
-        val success: Boolean,
-        val error: String = "",
-    )
+    /**
+     * 取登录用的**图形验证码**（SVG 文本）。
+     *
+     * 官方 H5（account 登录页）在被风控拦截时的完整做法：
+     *   `login` 返回 msg「本次登录需要进行验证」→ 调 `get_login_code?phone=`
+     *   → 拿 `data.codeImg`（一段 SVG）显示出来
+     *   → 用户输入 4 位 → 带 `code` 重新 login。
+     *
+     * 注意这个接口**必须带签名**，裸调返回「签名不能为空 」。
+     *
+     * @return SVG 字符串（150×50）
+     */
+    suspend fun fetchLoginCaptcha(phone: String): String = withContext(Dispatchers.IO) {
+        val signed = signRequest("phone" to phone)
+        val query = signed.entries.joinToString("&") { "${it.key}=${it.value}" }
+        val url = "$PLATFORM_SERVER/webapi/users/get_login_code?$query"
 
-    suspend fun sendSmsCode(phone: String): CodeResult = withContext(Dispatchers.IO) {
-        try {
-            val url = "${apiServer()}/webapi/users/get_login_code?phone=$phone"
-            android.util.Log.d("ServerApi", "发送验证码: $url")
+        val response = client.newCall(Request.Builder().url(url).get().build()).execute()
+        val bodyStr = response.body?.string() ?: ""
+        android.util.Log.d("ServerApi", "验证码响应 code=${response.code} body=${bodyStr.take(120)}")
 
-            val request = Request.Builder().url(url).get().build()
-            val response = client.newCall(request).execute()
-            val bodyStr = response.body?.string() ?: ""
-            android.util.Log.d("ServerApi", "验证码响应 code=${response.code} body=${bodyStr.take(200)}")
+        if (!response.isSuccessful) throw Exception("验证码获取失败 (HTTP ${response.code})")
+        val json = runCatching { JSONObject(bodyStr) }.getOrElse { throw Exception("验证码解析失败") }
+        if (!json.optBoolean("result", false)) throw Exception(errOf(json, "验证码获取失败"))
 
-            if (response.isSuccessful) {
-                CodeResult(true)
+        // data 是 base64 编码的 JSON，里面只有 codeImg 一个字段
+        val svg = runCatching {
+            val dataObj = json.optJSONObject("data")
+            if (dataObj != null) {
+                dataObj.optString("codeImg", "")
             } else {
-                val json = try { JSONObject(bodyStr) } catch (_: Exception) { JSONObject() }
-                CodeResult(false, json.optString("err_msg", "发送失败 (${response.code})"))
+                val raw = json.optString("data", "")
+                if (raw.startsWith("<")) raw
+                else JSONObject(decodeBase64Data(raw)).optString("codeImg", "")
             }
-        } catch (e: Exception) {
-            CodeResult(false, "${e.javaClass.simpleName}: ${e.message}")
-        }
+        }.getOrElse { "" }
+        if (svg.isBlank()) throw Exception("验证码内容为空")
+        svg
     }
 
     // ─── 登录 ───
@@ -150,14 +165,18 @@ object ServerApi {
         val token: String = "",
         val projectName: String = "",
         val error: String = "",
+        /** 服务器要求输入图形验证码（风控拦截），界面据此显示验证码输入框 */
+        val needCaptcha: Boolean = false,
     )
 
-    suspend fun login(phone: String, password: String): LoginResult = withContext(Dispatchers.IO) {
+    suspend fun login(phone: String, password: String, code: String = ""): LoginResult = withContext(Dispatchers.IO) {
         try {
             // GET /webapi/users/login (原 App 实际走这个 — cA = Ve = je.get("/webapi/users/login"))
+            // code 是图形验证码，为空表示本次还没走到验证那一步（官方同样固定带这个字段）
             val signed = signRequest(
                 "phone" to phone,
                 "pwd" to password,
+                "code" to code.trim(),
             )
             val query = signed.entries.joinToString("&") { "${it.key}=${it.value}" }
 
@@ -169,6 +188,8 @@ object ServerApi {
                 "https://f5-zhuli.whxinna.com",
             )
             val results = mutableListOf<String>()
+            // 平台服务器给出的第一条明确拒绝理由（账号不存在 / 密码错误 / 需要验证…）
+            var firstRefusal = ""
             for (srv in servers) {
                 val url = "$srv/webapi/users/login?$query"
                 val request = Request.Builder().url(url).get().build()
@@ -177,7 +198,19 @@ object ServerApi {
                 results.add("$srv → ${response.code} ${bodyStr.take(120)}")
                 if (response.code == 404 || bodyStr.isBlank()) continue
                 val json = try { JSONObject(bodyStr) } catch (_: Exception) { continue }
-                if (!json.optBoolean("result", false)) continue
+                if (!json.optBoolean("result", false)) {
+                    val msg = json.optString("msg", "").ifBlank { json.optString("message", "") }
+                    android.util.Log.d("ServerApi", "$srv 拒绝登录: $msg")
+                    // 风控要求图形验证码。必须立刻把 needCaptcha 交给界面去显示验证码输入框，
+                    // 不能像以前那样 continue 到下一台服务器 —— 那样这个信号就被彻底吞掉了。
+                    if (msg.contains("需要进行验证") || msg.contains("CAPTCHA") || msg.contains("验证码")) {
+                        return@withContext LoginResult(false, error = msg, needCaptcha = true)
+                    }
+                    if (firstRefusal.isBlank()) firstRefusal = msg
+                    // 平台服务器已明确答复，其余三台是同名项目服务器，没有意义
+                    if (msg.isNotBlank()) break
+                    continue
+                }
 
                 // 1. 先查顶层 platform_token
                 var token = json.optString("platform_token", "")
@@ -246,12 +279,17 @@ object ServerApi {
 
                 if (token.isNotBlank()) {
                     SettingsManager.platformToken = token
+                    SettingsManager.tokenSavedAt = System.currentTimeMillis()
                     // 把完整响应保存供调试
                     val saved = "token前20=${token.take(20)}... | 服务器=${SettingsManager.projectServerUrl.ifBlank{"无"}} | 完整=${bodyStr.take(500)}"
                     return@withContext LoginResult(true, token, saved)
                 }
             }
-            return@withContext LoginResult(false, error = results.joinToString("\n"))
+            return@withContext LoginResult(
+                false,
+                error = firstRefusal.ifBlank { "登录失败：服务器没有返回有效结果" } +
+                    if (SettingsManager.showLogs) "\n\n" + results.joinToString("\n") else "",
+            )
         } catch (e: Exception) {
             LoginResult(false, error = "${e.javaClass.simpleName}: ${e.message}")
         }
@@ -463,7 +501,7 @@ object ServerApi {
     suspend fun fetchAddress(): AddressInfo = withContext(Dispatchers.IO) {
         try {
             val token = SettingsManager.platformToken
-            if (token.isBlank()) throw Exception("未登录")
+            if (token.isBlank()) throw TokenExpiredException("尚未登录")
 
             // 调试: 打印所有 SettingsManager 值
             android.util.Log.d("ServerApi", "Settings: userId=${SettingsManager.userId}, " +
@@ -491,12 +529,18 @@ object ServerApi {
             val bodyStr = response.body?.string() ?: ""
             android.util.Log.d("ServerApi", "fetchAddress 响应: $bodyStr")
 
+            if (response.code == 401) throw TokenExpiredException("HTTP 401")
             if (!response.isSuccessful) throw Exception("HTTP ${response.code}: ${bodyStr.take(200)}")
 
             val json = try { JSONObject(bodyStr) } catch (_: Exception) {
                 throw Exception("JSON 解析失败: ${bodyStr.take(200)}")
             }
             if (!json.optBoolean("result", false)) {
+                // token 过期和「没绑门锁」「项目不匹配」这类业务错误必须分开，
+                // 否则调用方会拿着一串作废的 token 反复重试，永远恢复不了
+                if (isTokenDead(json, response.code)) {
+                    throw TokenExpiredException(errOf(json, "登录信息已失效"))
+                }
                 val msg = json.optString("msg", "").ifBlank {
                     json.optString("err_msg", "")
                 }
@@ -555,6 +599,8 @@ object ServerApi {
                 credentialId = credId,
                 chainKey = chainKey,
             )
+        } catch (e: TokenExpiredException) {
+            throw e   // 必须原样放行：包成普通异常后，重登逻辑就再也认不出它了
         } catch (e: Exception) {
             throw Exception("地址信息请求失败: ${e.message}")
         }
@@ -653,6 +699,97 @@ object ServerApi {
     private fun errOf(json: JSONObject, fallback: String): String =
         json.optString("msg", "").ifBlank { json.optString("err_msg", fallback) }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  会话有效性
+    //
+    //  官方 H5 的 axios 拦截器里，token 失效只有两个信号（它本身也没有 refresh token）：
+    //    · 响应 msg === "登录信息已失效，请重新登录！"
+    //    · HTTP 401
+    //  命中后官方直接 logout(true) 踢回登录页；我们则改成静默重登，把这一环补上。
+    // ═══════════════════════════════════════════════════════════════════
+
+    /** token 已过期 —— 与业务错误分开，好让调用方决定是否重登重试 */
+    class TokenExpiredException(message: String = "登录信息已失效") : Exception(message)
+
+    private fun isTokenDead(json: JSONObject, httpCode: Int): Boolean {
+        if (httpCode == 401) return true
+        if (json.optBoolean("result", false)) return false
+        val msg = errOf(json, "") + json.optString("code", "")
+        return msg.contains("登录信息已失效") ||
+            msg.contains("重新登录") ||
+            msg.contains("login_timeout") ||
+            msg.contains("error_user_id")
+    }
+
+    /**
+     * 用本地保存的手机号 + 密码静默重新登录。
+     *
+     * 走的是和设置页「登录」按钮完全相同的 [login]，所以只要那个按钮点得通，
+     * 这里就一定也通 —— 早先自动恢复失败纯粹是根本没走到这一步。
+     */
+    suspend fun relogin(): Boolean {
+        if (!SettingsManager.canAutoRelogin) {
+            android.util.Log.d("ServerApi", "relogin 跳过: 本地没有手机号+密码（支付宝登录用户）")
+            return false
+        }
+        android.util.Log.d("ServerApi", "relogin: 用本地账号静默重登 ${SettingsManager.loginPhone}")
+        // login() 内部会依次试 4 台服务器，最坏情况能拖到 40 秒 —— 而这时候
+        // 用户多半正站在门口等开门。给个总超时，宁可早点报失败。
+        val r = withTimeoutOrNull(18_000) {
+            login(SettingsManager.loginPhone, SettingsManager.loginPassword)
+        }
+        if (r == null) {
+            android.util.Log.d("ServerApi", "relogin 超时")
+            return false
+        }
+        android.util.Log.d("ServerApi", "relogin 结果: success=${r.success} err=${r.error.take(120)}")
+        return r.success
+    }
+
+    /** [fetchAddress] 的健壮版本：token 失效时自动重登并重试一次 */
+    suspend fun fetchAddressAuto(): AddressInfo = try {
+        fetchAddress()
+    } catch (e: TokenExpiredException) {
+        android.util.Log.d("ServerApi", "fetchAddress 命中 token 过期，准备静默重登")
+        SettingsManager.clearSession()
+        if (!relogin()) throw e
+        fetchAddress()
+    }
+
+    /**
+     * 启动时的静默预检：让 token 在日常使用里被续上，别拖到开门那一刻才炸。
+     *
+     * 只做登录，**不碰 chainKey** —— 服务器侧的凭证可能落后于门锁（本地轮换出来的
+     * key 从来没回传过），无条件覆盖会把一个能用的 key 换成废的。
+     *
+     * @param maxAgeHours 距上次确认可用不足这么多小时就直接跳过，避免每次冷启动都打网络
+     * @return true 表示当前 token 可用
+     */
+    suspend fun prewarmToken(maxAgeHours: Long = 24): Boolean {
+        if (!SettingsManager.canAutoRelogin) return SettingsManager.isLoggedIn()
+
+        val age = System.currentTimeMillis() - SettingsManager.tokenSavedAt
+        if (SettingsManager.isLoggedIn() && SettingsManager.tokenSavedAt > 0 &&
+            age < maxAgeHours * 3600_000L
+        ) {
+            return true
+        }
+
+        // 太旧或已过期：先探测一次（顺带确认网络与项目服务器都通），再决定要不要重登
+        return try {
+            fetchAddress()
+            SettingsManager.tokenSavedAt = System.currentTimeMillis()
+            true
+        } catch (_: TokenExpiredException) {
+            SettingsManager.clearSession()
+            relogin()
+        } catch (e: Exception) {
+            // 网络抖动之类不改动登录态，下次启动再试
+            android.util.Log.d("ServerApi", "prewarm 探测失败（登录态保持不动）: ${e.message}")
+            SettingsManager.isLoggedIn()
+        }
+    }
+
     /**
      * ① 取支付宝授权串 authStr。
      * 实测：该端点**不需要登录 token**，也不校验包名 / 签名 / versionName，
@@ -733,6 +870,7 @@ object ServerApi {
             data.optJSONObject("server_info")?.let { parseServerInfo(it) }
 
             SettingsManager.platformToken = token
+            SettingsManager.tokenSavedAt = System.currentTimeMillis()
             val pname = data.optJSONObject("server_info")?.optString("projectname", "") ?: ""
             LoginResult(true, token, pname.ifBlank { "支付宝登录成功" })
         } catch (e: Exception) {

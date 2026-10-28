@@ -76,6 +76,7 @@ object SettingsManager {
     private const val KEY_LOGIN_PHONE = "login_phone"
     private const val KEY_LOGIN_PASSWORD = "login_password"
     private const val KEY_PLATFORM_TOKEN = "platform_token"
+    private const val KEY_TOKEN_SAVED_AT = "platform_token_saved_at"
     private const val KEY_SERVER_URL = "server_url"
 
     var loginPhone: String
@@ -89,6 +90,40 @@ object SettingsManager {
     var platformToken: String
         get() = prefs.getString(KEY_PLATFORM_TOKEN, "") ?: ""
         set(v) = prefs.edit().putString(KEY_PLATFORM_TOKEN, v).apply()
+
+    /**
+     * 最后一次**确认会话可用**的时刻（毫秒）：登录成功会写，后台探测成功也会写。
+     *
+     * 为什么必须记这个：服务器下发的 token **会过期**，官方 H5 也没有 refresh token，
+     * 只会在收到「登录信息已失效」时直接踢回登录页。光判断 "token 非空" 无法区分
+     * 「真的能登录」和「留着一串早就作废的字符串」，后者会让自动恢复流程直接短路。
+     */
+    var tokenSavedAt: Long
+        get() = prefs.getLong(KEY_TOKEN_SAVED_AT, 0L)
+        set(v) = prefs.edit().putLong(KEY_TOKEN_SAVED_AT, v).apply()
+
+    /**
+     * 是否具备「后台静默重登」的条件：手机号和密码都还留着。
+     *
+     * 支付宝一键登录只会带回手机号，拿不到密码，因此那种账号只能靠 token 存活，
+     * 无法自动续期 —— 调用方据此决定是自动恢复还是提示用户手动登录。
+     */
+    val canAutoRelogin: Boolean
+        get() = loginPhone.isNotBlank() && loginPassword.isNotBlank()
+
+    /**
+     * 丢掉失效的会话令牌，但保留账号密码与项目信息。
+     *
+     * 一并清掉 identity_code 是必须的：它是项目服务器的会话令牌，和 platform_token
+     * 同时失效，如果留着旧的，重新登录后若服务器没回新的就会继续用废值。
+     */
+    fun clearSession() {
+        prefs.edit()
+            .remove(KEY_PLATFORM_TOKEN)
+            .remove(KEY_TOKEN_SAVED_AT)
+            .remove("identity_code")
+            .apply()
+    }
 
     val serverBaseUrl: String
         get() = "https://pm.whxinna.com"

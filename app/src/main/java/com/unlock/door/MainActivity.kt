@@ -161,6 +161,21 @@ class MainActivity : ComponentActivity() {
 
         // NFC 磁标签触发: 若本次启动由碰标签唤起（冷启动），直接开门
         handleNfcIntent(intent)
+
+        // 静默预检登录会话。
+        //
+        // platform_token 会过期，而官方 H5 根本没有 refresh token —— 它只会在收到
+        // 「登录信息已失效」时把用户踢回登录页。我们本地没有登录页可踢，所以必须
+        // 自己续：打开 App 时顺带确认一次，过期就悄悄用存的账号密码重登。
+        //
+        // 放后台跑，绝不阻塞启动；开门时若仍然撞上过期，BleUnlockManager 里
+        // 还有一层兜底（错误码 24/25 → 静默重登 → 重试开门）。
+        if (SettingsManager.canAutoRelogin) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                val ok = ServerApi.prewarmToken()
+                android.util.Log.d("MainActivity", "会话预检: ${if (ok) "可用" else "需手动登录"}")
+            }
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -186,7 +201,10 @@ class MainActivity : ComponentActivity() {
         val adapter = nfcAdapter ?: return
         if (!adapter.isEnabled) return
         val options = Bundle().apply {
-            putInt(NfcAdapter.EXTRA_READER_PRESENCE_CHECK_DELAY, 250)
+            // 在场检测要克制。这个检测和我们的 transceive 走同一条 HAL 通道，250ms 太激进：
+            // 检测命令一旦插在 0xB1 收发之间，芯片报一次失败就会把标签判为离场，
+            // 句柄随即失效，后面的重试全部打在一个死句柄上 —— 表现为「NFC 未成功」。
+            putInt(NfcAdapter.EXTRA_READER_PRESENCE_CHECK_DELAY, 1_000)
         }
         runCatching {
             adapter.enableReaderMode(

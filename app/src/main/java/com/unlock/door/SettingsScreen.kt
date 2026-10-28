@@ -4,6 +4,7 @@ import android.nfc.NfcAdapter
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.*
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -21,6 +22,12 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.withTransform
+import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -30,7 +37,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.unlock.door.ui.theme.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 设置页面 — 填入门锁参数并持久化保存
@@ -96,6 +105,30 @@ fun SettingsScreen(
             ) }
             var loginLoading by remember { mutableStateOf(false) }
 
+            // 图形验证码：只有被服务端风控拦住时才出现（换手机、异地登录、密码试错过多都会撞上）。
+            // 官方 H5 的处理也是同一套：登录返回「本次登录需要进行验证」→ 拉 codeImg → 带 code 重登。
+            var needCaptcha by remember { mutableStateOf(false) }
+            var captchaSvg by remember { mutableStateOf("") }
+            var captchaCode by remember { mutableStateOf("") }
+
+            // 拉参数的状态提到这里：「登录 → 自动获取参数」要合成一步，
+            // 登录按钮那边也得能写这两个状态
+            var fetching by remember { mutableStateOf(false) }
+            var fetchResult by remember { mutableStateOf("") }
+
+            // 把一次拉取结果同时写进输入框和本地存储，两个入口（登录后自动 / 手动点按钮）共用
+            val applyPulled: (PullOutcome) -> Unit = { outcome ->
+                val a = outcome.info
+                if (a != null) {
+                    deviceId = a.deviceId.toString()
+                    deviceMac = a.mac
+                    credentialId = a.credentialId.toString()
+                    projectId = SettingsManager.projectId.toString()
+                    chainKey = a.chainKey
+                }
+                fetchResult = outcome.message
+            }
+
             Card(
                 shape = MaterialTheme.shapes.medium,
                 colors = CardDefaults.cardColors(
@@ -145,6 +178,47 @@ fun SettingsScreen(
                     )
                     Spacer(Modifier.height(8.dp))
 
+                    // ── 图形验证码（服务端风控要求时才出现） ──
+                    if (needCaptcha) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            OutlinedTextField(
+                                value = captchaCode,
+                                onValueChange = { v ->
+                                    captchaCode = v.filter { it.isLetterOrDigit() }.take(4)
+                                },
+                                modifier = Modifier.weight(1f),
+                                placeholder = { Text("图形验证码", fontSize = 13.sp) },
+                                singleLine = true,
+                                shape = MaterialTheme.shapes.small,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = SeuGreen, cursorColor = SeuGreen,
+                                ),
+                            )
+                            CaptchaView(
+                                svg = captchaSvg,
+                                modifier = Modifier.size(width = 118.dp, height = 44.dp),
+                                onRefresh = {
+                                    scope.launch {
+                                        val svg = runCatching {
+                                            withContext(Dispatchers.IO) {
+                                                ServerApi.fetchLoginCaptcha(loginPhone.trim())
+                                            }
+                                        }.getOrNull()
+                                        if (svg != null) {
+                                            captchaSvg = svg
+                                            captchaCode = ""
+                                        }
+                                    }
+                                },
+                            )
+                        }
+                        Spacer(Modifier.height(8.dp))
+                    }
+
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -154,32 +228,47 @@ fun SettingsScreen(
                                 if (loginLoading) return@Button
                                 loginLoading = true
                                 loginStatus = ""
-                                kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-                                    try {
-                                        val result = ServerApi.login(loginPhone.trim(), loginPassword)
-                                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                                            if (result.success) {
-                                                loginStatus = if (SettingsManager.showLogs)
-                                                    "已登录\n${result.projectName}"
-                                                else
-                                                    "登录成功"
-                                            } else {
-                                                loginStatus = if (SettingsManager.showLogs)
-                                                    result.error
-                                                else
-                                                    "登录失败"
-                                            }
-                                            loginLoading = false
-                                        }
-                                    } catch (e: Exception) {
-                                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                                            loginStatus = "崩溃: ${e.message}"
-                                            loginLoading = false
-                                        }
+                                fetchResult = ""
+                                scope.launch {
+                                    val result = withContext(Dispatchers.IO) {
+                                        ServerApi.login(loginPhone.trim(), loginPassword, captchaCode)
                                     }
+                                    if (!result.success) {
+                                        if (result.needCaptcha) {
+                                            // 风控拦截：先把输入框亮出来，再拉一张新图
+                                            needCaptcha = true
+                                            captchaCode = ""
+                                            loginStatus = "需要输入图形验证码"
+                                            val svg = runCatching {
+                                                withContext(Dispatchers.IO) {
+                                                    ServerApi.fetchLoginCaptcha(loginPhone.trim())
+                                                }
+                                            }.getOrNull()
+                                            if (svg != null) captchaSvg = svg
+                                            else loginStatus = "验证码获取失败，请检查网络后重试"
+                                        } else {
+                                            loginStatus = if (SettingsManager.showLogs)
+                                                result.error else "登录失败"
+                                        }
+                                        loginLoading = false
+                                        return@launch
+                                    }
+                                    needCaptcha = false
+                                    captchaSvg = ""
+                                    captchaCode = ""
+                                    loginStatus = if (SettingsManager.showLogs)
+                                        "已登录\n${result.projectName}" else "登录成功"
+
+                                    // 登录成功就直接把参数接上 —— 以前要再点一次「自动获取参数」
+                                    fetching = true
+                                    val outcome = withContext(Dispatchers.IO) { pullDoorLockParams() }
+                                    applyPulled(outcome)
+                                    fetching = false
+                                    loginLoading = false
                                 }
                             },
-                            enabled = loginPhone.isNotBlank() && loginPassword.isNotBlank() && !loginLoading,
+                            enabled = loginPhone.isNotBlank() && loginPassword.isNotBlank() && !loginLoading &&
+                                (!needCaptcha || captchaCode.length >= 4),
                             shape = MaterialTheme.shapes.small,
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = SeuGreenDeep,
@@ -224,6 +313,7 @@ fun SettingsScreen(
                             }
                             alipayLoading = true
                             alipayStatus = ""
+                            fetchResult = ""
                             scope.launch {
                                 try {
                                     val authInfo = ServerApi.fetchAlipayAuthInfo()
@@ -233,6 +323,11 @@ fun SettingsScreen(
                                         loginPhone = SettingsManager.loginPhone
                                         loginStatus = if (SettingsManager.showLogs)
                                             "已登录\n${result.projectName}" else "登录成功"
+                                        // 同上：登录完直接接上拉参数
+                                        fetching = true
+                                        val outcome = withContext(Dispatchers.IO) { pullDoorLockParams() }
+                                        applyPulled(outcome)
+                                        fetching = false
                                     } else {
                                         alipayStatus = result.error
                                     }
@@ -273,41 +368,15 @@ fun SettingsScreen(
                     // 登录成功后显示自动获取按钮
                     if (SettingsManager.isLoggedIn()) {
                         Spacer(Modifier.height(8.dp))
-                        var fetching by remember { mutableStateOf(false) }
-                        var fetchResult by remember { mutableStateOf("") }
 
                         Button(
                             onClick = {
                                 fetching = true
                                 fetchResult = ""
-                                kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-                                    try {
-                                        val addr = ServerApi.fetchAddress()
-                                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                                            if (addr.deviceId == 0) {
-                                                fetchResult = "未找到门锁设备"
-                                                fetching = false
-                                                return@withContext
-                                            }
-                                            deviceId = addr.deviceId.toString()
-                                            deviceMac = addr.mac
-                                            credentialId = addr.credentialId.toString()
-                                            projectId = SettingsManager.serverAppId
-                                            chainKey = addr.chainKey
-                                            SettingsManager.deviceId = addr.deviceId
-                                            SettingsManager.deviceMac = addr.mac
-                                            SettingsManager.credentialId = addr.credentialId
-                                            SettingsManager.projectId = SettingsManager.serverAppId.toIntOrNull() ?: 0
-                                            SettingsManager.chainKey = addr.chainKey
-                                            fetchResult = "已获取: XN-${addr.deviceId} (${addr.buildingName} ${addr.roomName})"
-                                            fetching = false
-                                        }
-                                    } catch (e: Exception) {
-                                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                                            fetchResult = "获取失败: ${e.message}"
-                                            fetching = false
-                                        }
-                                    }
+                                scope.launch {
+                                    val outcome = withContext(Dispatchers.IO) { pullDoorLockParams() }
+                                    applyPulled(outcome)
+                                    fetching = false
                                 }
                             },
                             enabled = !fetching,
@@ -726,3 +795,111 @@ private fun PrincipleNote(
         }
     }
 }
+
+// ── 「拉参数」的统一实现 ──
+
+private data class PullOutcome(
+    val message: String,
+    val info: ServerApi.AddressInfo? = null,
+)
+
+/**
+ * 从服务器拉取门锁参数并落盘。
+ *
+ * 走 [ServerApi.fetchAddressAuto]：token 过期会**自动重登再重试一次**，
+ * 所以「凭证更新」这件事不再依赖用户记得先点登录。
+ */
+private suspend fun pullDoorLockParams(): PullOutcome = try {
+    val addr = ServerApi.fetchAddressAuto()
+    if (addr.deviceId == 0) {
+        PullOutcome("未找到门锁设备")
+    } else {
+        SettingsManager.deviceId = addr.deviceId
+        SettingsManager.deviceMac = addr.mac
+        SettingsManager.credentialId = addr.credentialId
+        // serverAppId 才是项目 ID；拿不到就保留原值，别把已有配置写成 0
+        SettingsManager.serverAppId.toIntOrNull()?.let { SettingsManager.projectId = it }
+        SettingsManager.chainKey = addr.chainKey
+        PullOutcome(
+            "已获取: XN-${addr.deviceId} (${addr.buildingName} ${addr.roomName})",
+            addr,
+        )
+    }
+} catch (e: Exception) {
+    PullOutcome("获取失败: ${e.message}")
+}
+
+// ─────────────────────── 图形验证码渲染 ───────────────────────
+
+/**
+ * 服务端下发的验证码是一段 SVG（150×50，六个 path，无 transform、无文字）。
+ *
+ * 所以不引 WebView、也不加 SVG 依赖：直接用 Compose 自带的 [PathParser] 把 `d` 属性
+ * 解析成 Path，再按比例缩放画到 Canvas 上。整个开销就是几十个 Path 对象，
+ * 比拉一个 WebView 实例（几十 MB 内存 + 首次初始化延迟）轻得多。
+ */
+private data class CaptchaShape(
+    val path: Path,
+    val color: Color,
+    val filled: Boolean,
+)
+
+@Composable
+private fun CaptchaView(
+    svg: String,
+    modifier: Modifier = Modifier,
+    onRefresh: () -> Unit,
+) {
+    val shapes = remember(svg) { parseCaptchaSvg(svg) }
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(SeuSurface)
+            .clickable { onRefresh() },
+        contentAlignment = Alignment.Center,
+    ) {
+        if (shapes.isEmpty()) {
+            Text("点击获取", fontSize = 12.sp, color = SeuGreen)
+        } else {
+            Canvas(modifier = Modifier.fillMaxSize().padding(3.dp)) {
+                val sx = size.width / 150f
+                val sy = size.height / 50f
+                withTransform({ scale(sx, sy, pivot = Offset.Zero) }) {
+                    shapes.forEach { s ->
+                        if (s.filled) {
+                            drawPath(s.path, s.color)
+                        } else {
+                            drawPath(s.path, s.color, style = Stroke(width = 1.2f))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun parseCaptchaSvg(svg: String): List<CaptchaShape> {
+    if (svg.isBlank()) return emptyList()
+    val out = mutableListOf<CaptchaShape>()
+    val pathTag = Regex("<path\\b([^>]*)>", RegexOption.IGNORE_CASE)
+    val dAttr = Regex("\\bd=\"([^\"]+)\"")
+    val fillAttr = Regex("\\bfill=\"([^\"]+)\"")
+    val strokeAttr = Regex("\\bstroke=\"([^\"]+)\"")
+
+    for (m in pathTag.findAll(svg)) {
+        val attrs = m.groupValues[1]
+        val d = dAttr.find(attrs)?.groupValues?.get(1) ?: continue
+        val fill = fillAttr.find(attrs)?.groupValues?.get(1) ?: "#333333"
+        val stroke = strokeAttr.find(attrs)?.groupValues?.get(1)
+        val path = runCatching { PathParser().parsePathString(d).toPath() }.getOrNull() ?: continue
+        if (fill == "none") {
+            out.add(CaptchaShape(path, captchaColor(stroke ?: "#999999"), filled = false))
+        } else {
+            out.add(CaptchaShape(path, captchaColor(fill), filled = true))
+        }
+    }
+    return out
+}
+
+private fun captchaColor(v: String): Color =
+    runCatching { Color(android.graphics.Color.parseColor(v)) }.getOrDefault(Color(0xFF333333))
