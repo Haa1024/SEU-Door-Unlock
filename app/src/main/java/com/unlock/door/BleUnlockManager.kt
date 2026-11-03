@@ -252,49 +252,18 @@ class BleUnlockManager(
      */
     private suspend fun refreshChainKeyFromServer(): String? {
         lastRefreshError = null
-        try {
-            val addr = ServerApi.fetchAddressAuto()
-            val key = addr.chainKey.trim()
-
-            if (key.isBlank()) {
-                lastRefreshError = "服务器没有返回凭证（该账号下可能没有这台门锁的记录）"
-                log("刷新凭证失败: $lastRefreshError")
-                return null
-            }
-            // 格式把关：自动流程只认 32 字节 hex。写进一个长度不对的值，
-            // 会让下次开门连 0x74 都构造不出来，比"刷新失败"更糟。
-            if (key.length != 64 || key.any { it !in "0123456789abcdefABCDEF" }) {
-                lastRefreshError = "服务器返回的凭证格式异常（长度 ${key.length}），已放弃覆盖本地"
-                log("刷新凭证失败: $lastRefreshError")
-                return null
-            }
-            // 拉回来的和本地一模一样 → 服务器侧也没更新过，重试必然还失败。
-            // 这种情况只有官方 App 开门时才会把链追上去，老实告诉用户比反复重试有用。
-            if (key.equals(SettingsManager.chainKey, ignoreCase = true)) {
-                lastRefreshError =
-                    "服务器上的凭证和本地相同，说明服务器侧也已落后于门锁\n" +
-                        "请用住理生活官方 App 开一次门追链后再试"
-                log("刷新凭证失败: 服务器凭证未更新")
-                return null
-            }
-
-            SettingsManager.chainKey = key
-            SettingsManager.credentialId = addr.credentialId
-            log("已从服务器获取新 chainKey: ${key.take(16)}...")
-            return key
-        } catch (e: ServerApi.TokenExpiredException) {
-            lastRefreshError = if (SettingsManager.canAutoRelogin) {
-                "登录已失效，静默重登也没成功（密码可能改过，请到设置页重新登录一次）"
-            } else {
-                "登录已失效，且本地没保存密码，无法自动重登（请到设置页点一次「支付宝一键登录」）"
-            }
+        // 具体动作全部收敛到 ServerApi.refreshChainKey：拉取、静默重登、三道校验、落盘。
+        // 之所以不再在这里各写一份 —— NFC 那条链路用的是另一套结果码（11/12 而不是 24/25），
+        // 两套分支各写一遍必然漂移，而凭证刷新是最不能有两份实现的地方。
+        val r = ServerApi.refreshChainKey()
+        val key = r.key
+        if (key == null) {
+            lastRefreshError = r.error ?: "未知原因"
             log("刷新凭证失败: $lastRefreshError")
             return null
-        } catch (e: Exception) {
-            lastRefreshError = e.message?.take(150) ?: "网络异常"
-            log("刷新凭证异常: $lastRefreshError")
-            return null
         }
+        log("已从服务器获取新 chainKey: ${key.take(16)}...")
+        return key
     }
 
     private suspend fun retryUnlockWithNewKey() {

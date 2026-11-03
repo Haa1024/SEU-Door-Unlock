@@ -790,6 +790,69 @@ object ServerApi {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  凭证刷新 —— BLE 错误码 24/25 与 NFC 结果码 11/12 共用同一条恢复链
+    // ═══════════════════════════════════════════════════════════════════
+
+    /** [refreshChainKey] 的结果：要么拿到新 key，要么给出人话级别的失败原因 */
+    data class ChainKeyRefresh(
+        val key: String? = null,
+        val error: String? = null,
+    )
+
+    /**
+     * 从服务器拉回「现在应该用的」chainKey 并落盘。
+     *
+     * 为什么必须只有这一份实现：门锁说「凭证过期」有**两套码表**（官方 hooks.js 里
+     * 明确有两张表）——
+     *   BLE 表："已过有效期"=24、"离线次数已用完"=25
+     *   NFC 表："已过有效期"=11、"离线次数已用完"=12
+     * 同一件事换了编号，处理方式完全一样：把服务器上那份拉下来替换本地。
+     * 早先这段逻辑只写在 BLE 分支里，NFC 撞上 11 就无处可去，只能人工进设置页
+     * 点「一键获取参数」—— 表现为「明明提示已过有效期，却迟迟不自动更新」。
+     *
+     * 三道闸门都是为了让「自动」别变成「自动写坏」：
+     *   ① 登录失效 → [fetchAddressAuto] 内部静默重登再试一次（不再短路）
+     *   ② 必须是 64 位 hex —— 写进长度不对的值，下次连 0x74 凭证头都构造不出来
+     *   ③ 与本地完全相同 → 服务器侧也已落后于门锁，覆盖只会把能用的旧值换成废值
+     */
+    suspend fun refreshChainKey(): ChainKeyRefresh {
+        return try {
+            val addr = fetchAddressAuto()
+            val key = addr.chainKey.trim()
+
+            when {
+                key.isBlank() -> ChainKeyRefresh(
+                    error = "服务器没有返回凭证（该账号下可能没有这台门锁的记录）"
+                )
+
+                key.length != 64 || key.any { it !in "0123456789abcdefABCDEF" } -> ChainKeyRefresh(
+                    error = "服务器返回的凭证格式异常（长度 ${key.length}），已放弃覆盖本地"
+                )
+
+                key.equals(SettingsManager.chainKey, ignoreCase = true) -> ChainKeyRefresh(
+                    error = "服务器上的凭证和本地相同，说明服务器侧也已落后于门锁\n" +
+                        "请用住理生活官方 App 开一次门追链后再试"
+                )
+
+                else -> {
+                    SettingsManager.chainKey = key
+                    SettingsManager.credentialId = addr.credentialId
+                    ChainKeyRefresh(key = key)
+                }
+            }
+        } catch (e: TokenExpiredException) {
+            ChainKeyRefresh(
+                error = if (SettingsManager.canAutoRelogin)
+                    "登录已失效，静默重登也没成功（密码可能改过，请到设置页重新登录一次）"
+                else
+                    "登录已失效，且本地没保存密码，无法自动重登（请到设置页登录一次）"
+            )
+        } catch (e: Exception) {
+            ChainKeyRefresh(error = e.message?.take(150) ?: "网络异常")
+        }
+    }
+
     /**
      * ① 取支付宝授权串 authStr。
      * 实测：该端点**不需要登录 token**，也不校验包名 / 签名 / versionName，

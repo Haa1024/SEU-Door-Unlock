@@ -33,6 +33,18 @@ object NfcDoorLockManager {
     /** UI 回调 (主线程): 开锁结果 —— 前台读卡器模式用；后台分发走 handleTag 的 callback 参数 */
     var onUnlockResult: ((ok: Boolean, message: String) -> Unit)? = null
 
+    /**
+     * 最近一次 [handleTag] 的**门锁结果码**（-1 = 还没拿到合法响应）。
+     *
+     * 为什么要透出来：结果码决定「还有没有救、该怎么救」。11(已过有效期) /
+     * 12(离线次数用完) 换个 chainKey 就能开，而「无响应」再怎么重试也是白费。
+     * 回调原本只有 (是否成功, 文案)，调用方拿到「已过有效期」这句人话，
+     * 却无法据此判断该不该去刷新凭证。
+     */
+    @Volatile
+    var lastResultCode: Int = -1
+        private set
+
     // ─── 通讯日志 (环形缓冲) ───
     private val logBuf = ArrayDeque<String>()
 
@@ -80,6 +92,7 @@ object NfcDoorLockManager {
 
     /** @return (是否成功, 提示消息)。null 表示写卡模式已接管，无需回报结果 */
     private fun processTag(tag: Tag): Pair<Boolean, String>? {
+        lastResultCode = -1
         appendLog("═══ 标签发现 ═══")
         appendLog("技术: ${tag.techList.joinToString(",") { it.substringAfterLast('.') }}")
         appendLog("UID: ${Crypto.bytesToHex(tag.id)}")
@@ -151,9 +164,13 @@ object NfcDoorLockManager {
         val result = Crypto.parseNfcResponse(response, deviceId)
         if (result.error != null) appendLog("✗ 解析: ${result.error}")
         if (!result.success) {
+            // 门锁给了合法应答但拒绝开门 —— 结果码要透出去，调用方据此判断
+            // 是「该去刷新凭证」还是「彻底没救」。
+            lastResultCode = result.resultCode
             appendLog("✗ 开锁失败: ${result.message} (结果码=${result.resultCode})")
             return Pair(false, result.message.ifEmpty { result.error ?: "开门失败" })
         }
+        lastResultCode = result.resultCode
 
         // ── 5. 密钥轮换 (锁返回新 chainKey, 与官方 H5 行为一致) ──
         result.newChainKeyHex?.let { newKey ->

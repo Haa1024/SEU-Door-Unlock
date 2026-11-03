@@ -84,7 +84,21 @@ class MainActivity : ComponentActivity() {
 
         // NFC 门锁开门结果回调 (含磁标签触发 BLE 开门的特殊分支)
         nfcDoorLock.onUnlockResult = { ok, msg ->
-            if (msg == NfcDoorLockManager.STICKER_UNLOCK) {
+            // 碰锁撞上「凭证过期」(NFC 结果码 11/12) 时，重贴同一个旧 chainKey 也没用，
+            // 必须先去服务器换一版。刷新是静默的，只提示一句"再碰一次"——
+            // 抬手再贴本来就比等网络快。
+            val code = nfcDoorLock.lastResultCode
+            if (!ok && code in setOf(11, 12)) {
+                Toast.makeText(this, "凭证已过期，正在自动更新，稍后请再碰一次", Toast.LENGTH_SHORT).show()
+                lifecycleScope.launch(Dispatchers.IO) {
+                    val r = ServerApi.refreshChainKey()
+                    android.util.Log.w(
+                        "MainActivity",
+                        if (r.key != null) "碰锁：凭证已自动刷新 ${r.key.take(12)}…"
+                        else "碰锁：刷新凭证失败 ${r.error}"
+                    )
+                }
+            } else if (msg == NfcDoorLockManager.STICKER_UNLOCK) {
                 Toast.makeText(this, "NFC 标签触发开门...", Toast.LENGTH_SHORT).show()
                 doUnlock()
             } else {
